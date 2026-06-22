@@ -1,62 +1,98 @@
-# Robot-Framework V4
+# Tilmelding til Altinget – OpenOrchestrator Robot
 
-This repo is meant to be used as a template for robots made for [OpenOrchestrator](https://github.com/itk-dev-rpa/OpenOrchestrator) v2.
+An [OpenOrchestrator](https://github.com/itk-dev-rpa/OpenOrchestrator) robot that registers
+employee sign-ups for *Altinget* in a SharePoint list. When an employee submits the
+**"Tilmelding til Altinget"** form in OS2Forms, the robot picks up the submission, reads the
+employee data, and creates a corresponding row in a SharePoint list.
 
-## Quick start
+## How it works
 
-1. To use this template simply use this repo as a template (see [Creating a repository from a template](https://docs.github.com/en/repositories/creating-and-managing-repositories/creating-a-repository-from-a-template)).
-__Don't__ include all branches.
+The robot runs as a queue-based process in openorchestrator. Each queue element references a single OS2Forms
+submission, and the robot processes it as follows:
 
-2. Go to `robot_framework/__main__.py` and choose between the linear framework or queue based framework.
+1. **Read the queue element.** The element's `data` contains an `application_uuid` — the ID
+   of the OS2Forms submission to process.
+2. **Fetch the submission** from the OS2Forms REST API
+   (`<api-url>/tilmelding_til_altinget/submission/<application_uuid>`), authenticated with an
+   API key. The employee fields live under `data.mine_medarbejder_data`.
+3. **Authenticate to SharePoint** using an app-only (client certificate) login against the
+   team site.
+4. **Map the form fields** to the internal SharePoint column names (see table below).
+5. **Create a new list item** in *Tilmeldte medarbejdere*. On any failure the error is logged
+   and re-raised, so the queue element is marked **FAILED** rather than silently completing.
 
-3. Implement all functions in the files:
-    * `robot_framework/initialize.py`
-    * `robot_framework/reset.py`
-    * `robot_framework/process.py`
+## Field mapping
 
-4. Change `config.py` to your needs.
+The form fields from `mine_medarbejder_data` are mapped to the **internal** SharePoint column
+names (not the display names):
 
-5. Fill out the dependencies in the `pyproject.toml` file with all packages needed by the robot.
-
-6. Feel free to add more files as needed. Remember that any additional python files must
-be located in the folder `robot_framework` or a subfolder of it.
-
-When the robot is run from OpenOrchestrator the `main.py` file is run which results
-in the following:
-
-1. The working directory is changed to where `main.py` is located.
-2. A virtual environment is automatically setup with the required packages.
-3. The framework is called passing on all arguments needed by [OpenOrchestrator](https://github.com/itk-dev-rpa/OpenOrchestrator).
+| OS2Forms field         | SharePoint column (internal name)  | Example value        |
+| ---------------------- | ---------------------------------- | -------------------- |
+| `name`                 | `Title`                            | Employee name        |
+| `az`                   | `Az_x002d_ident`                   | AZ identifier        |
+| `organisation_enhed`   | `Afdeling`                         | Digital Udvikling    |
+| `organisation_niveau_2`| `Organisatoriskenhedovermedarbejd` | Digitalisering MTM   |
+| `magistrat`            | `Magistratsafdeling`               | Teknik og Miljø      |
 
 ## Requirements
 
-Minimum python version 3.11
+- Python **3.11+** (required by OpenOrchestrator 3.x)
+- Dependencies (see `pyproject.toml`):
+  - `OpenOrchestrator`
+  - `Office365-REST-Python-Client`
+  - `requests`
 
-## Flow
+```toml
+[project]
+requires-python = ">=3.11"
+dependencies = [
+    "OpenOrchestrator>=3.0.0",
+    "Office365-REST-Python-Client>=2.6.2",
+    "requests>=2.34.2",
+]
+```
 
-This framework contains two different flows: A linear and a queue based.
-You should only ever use one at a time. You choose which one by going into `robot_framework/__main__.py`
-and uncommenting the framework you want. They are both disabled by default and an error will be
-raised to remind you if you don't choose.
+## Configuration
 
-### Linear Flow
+The robot reads its credentials and settings from OpenOrchestrator. These must exist before
+the robot is run:
 
-The linear framework is used when a robot is just going from A to Z without fetching jobs from an
-OpenOrchestrator queue.
-The flow of the linear framework is sketched up in the following illustration:
+| Type       | Name                      | Contents                                          |
+| ---------- | ------------------------- | ------------------------------------------------- |
+| Credential | `OS2FormsAPI`             | username = API base URL, password = API key       |
+| Credential | `SharePointAPI`           | username = tenant, password = client ID           |
+| Credential | `SharePointCert`          | username = certificate thumbprint, password = path to certificate (PEM) |
+| Constant   | `AarhusKommuneSharePoint` | Base SharePoint URL                               |
 
-![Linear Flow diagram](Robot-Framework.svg)
+**Target site and list**
 
-### Queue Flow
+- Site: `<AarhusKommuneSharePoint>/Teams/tea-teamsite12592`
+- List: `Tilmeldte medarbejdere`
 
-The queue framework is used when the robot is doing multiple bite-sized tasks defined in an
-OpenOrchestrator queue.
-The flow of the queue framework is sketched up in the following illustration:
+The Azure AD app behind the certificate must have **write** permission to the target site
+(e.g. `Sites.Selected` granted with Write, or broader). Read-only access is not enough to
+create list items.
 
-![Queue Flow diagram](Robot-Queue-Framework.svg)
+## Setup
 
-## Linting and Github Actions
+1. Install the dependencies (`pip install -e .` or your usual workflow).
+2. Create the credentials and constant listed above in OpenOrchestrator.
+3. Make sure the SharePoint app registration has write access to the target site.
+4. Configure a trigger that enqueues OS2Forms submissions and points OpenOrchestrator at this
+   process.
 
-This template is also setup with flake8 and pylint linting in Github Actions.
-This workflow will trigger whenever you push your code to Github.
-The workflow is defined under `.github/workflows/Linting.yml`.
+## Known gotchas
+
+- **Internal column names are not display names.** SharePoint encodes spaces and special
+  characters at column-creation time (`-` becomes `_x002d_`, `ø` becomes `_x00f8_`, etc.) and
+  truncates internal names at 32 characters — which is why `Organisatoriskenhedovermedarbejd`
+  looks cut off but is correct. Use the `get_internal_column_names()` helper to list the
+  current internal names before changing the mapping.
+
+- **There are three columns displaying as "Magistratsafdeling"** (`Magistratsafdeling`,
+  `Magistratsafdeling0`, `Magistratsafdeling1`). Writing to the wrong one succeeds *without an
+  error* but lands the value in a column the view doesn't show. Confirm which internal name
+  backs the visible column before relying on the mapping.
+
+- **Empty form fields** come back as empty strings (`""`), not `null`. The robot skips empty
+  values so blank fields are not written.
