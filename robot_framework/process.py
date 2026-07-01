@@ -5,8 +5,58 @@ from OpenOrchestrator.database.queues import QueueElement
 import json
 import requests
 from office365.sharepoint.client_context import ClientContext
+import pyodbc
+import smtplib
+from email.message import EmailMessage
+
+def send_forkert_mag_mail(az, orchestrator_connection):
+    SMTP_SERVER = "smtp.adm.aarhuskommune.dk"
+    SMTP_PORT = 25
+    SCREENSHOT_SENDER = "PersonaleAktindsigtssag@aarhus.dk"
+    html_failed = f"""
+    <html>
+    <body>
+        <p>Der er oprettet adgang til altinget fra en bruger udenfor MTM. Az er {az}</p>
+    </body>
+    </html>
+    """
+    # Create the email message
+    UdviklerMail = orchestrator_connection.get_constant('balas').value
+
+    msg_failed = EmailMessage()
+    msg_failed['To'] = UdviklerMail
+    msg_failed['From'] = SCREENSHOT_SENDER
+    msg_failed['Subject'] = "Altinget oprettelse - forkert magistratsafdeling"
+    msg_failed.set_content("Please enable HTML to view this message.")
+    msg_failed.add_alternative(html_failed, subtype='html')
+
+    # Send the email using SMTP
+    try:
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as smtp:
+            smtp.send_message(msg_failed)
+    except Exception as e:
+        orchestrator_connection.log_info(f"Failed to send error email: {e}")
 
 
+def get_magistrat_from_fdw(orchestrator_connection: OrchestratorConnection, az_ident: str) -> str | None:
+    """Slår magistratsafdeling op i FDW baseret på az-ident, hvis feltet er tomt i formularen."""
+    az_ident = az_ident.upper()
+
+    sql_server_f = orchestrator_connection.get_constant("sqlserverf").value
+    conn_string_f = f"DRIVER={{SQL Server}};SERVER={sql_server_f};DATABASE=FDW;Trusted_Connection=yes;"
+
+    query = """
+        SELECT Niveau2_Navn
+        FROM FDW.pdb.PersonLight_udvidet
+        WHERE Azident = ?
+    """
+
+    with pyodbc.connect(conn_string_f, timeout=30) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(query, az_ident)
+            row = cursor.fetchone()
+            return row[0] if row and row[0] else None
+        
 # pylint: disable-next=unused-argument
 def process(orchestrator_connection: OrchestratorConnection, queue_element: QueueElement | None = None) -> None:
     """Do the primary process of the robot."""
@@ -43,6 +93,16 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
     payload = response.json()
     # "data" ligger på top-niveau ved siden af "entity" (ikke inde i entity)
     form = payload["data"]["mine_medarbejder_data"]
+    if not form.get("magistrat"):
+        az_ident = form.get("az")
+        magistrat = get_magistrat_from_fdw(orchestrator_connection, az_ident)
+        if magistrat != "Teknik og Miljø":
+            send_forkert_mag_mail(az_ident, orchestrator_connection= orchestrator_connection)
+        if magistrat:
+            form["magistrat"] = magistrat
+            orchestrator_connection.log_info(f"Magistrat var tom, hentet fra FDW: {magistrat}")
+        else:
+            orchestrator_connection.log_info("Magistrat var tom, og kunne ikke findes i FDW.")
     submission_uuid = payload["entity"]["uuid"][0]["value"]  # global unik – til evt. dedup
 
     # Venstre side = de PRÆCISE nøgler fra form-JSON'en.
