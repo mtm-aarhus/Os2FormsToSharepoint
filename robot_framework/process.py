@@ -8,6 +8,28 @@ from office365.sharepoint.client_context import ClientContext
 import pyodbc
 import smtplib
 from email.message import EmailMessage
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+COPENHAGEN_TZ = ZoneInfo("Europe/Copenhagen")
+
+
+def local_to_sharepoint_utc(date_str: str, time_str: str = "00:00:00") -> str:
+    """
+    Konverterer en lokal dansk dato/tid (Europe/Copenhagen, inkl. sommer-/vintertid)
+    til en UTC ISO8601-streng, som SharePoints DateTime-felter forventer.
+    Uden denne konvertering risikerer man at datoen forskydes en dag ved
+    visning, fordi SharePoint gemmer DateTime-felter internt i UTC.
+    """
+    naive_dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M:%S")
+    local_dt = naive_dt.replace(tzinfo=COPENHAGEN_TZ)
+    utc_dt = local_dt.astimezone(ZoneInfo("UTC"))
+    return utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def format_time_text(time_str: str) -> str:
+    """Formatterer et tidspunkt fra formularen ('11:00:00') til 'HH:MM' til Text-feltet."""
+    return datetime.strptime(time_str, "%H:%M:%S").strftime("%H:%M")
 
 def send_forkert_mag_mail(az, orchestrator_connection):
     SMTP_SERVER = "smtp.adm.aarhuskommune.dk"
@@ -75,6 +97,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
     api = orchestrator_connection.get_credential("SharePointAPI")
     base_url = f'{orchestrator_connection.get_constant("AarhusKommuneSharePoint").value}'
     altinget_endelse = '/Teams/tea-teamsite12592'
+    cykel_endelse = '/Teams/tea-teamsite11485'
 
     cert_credentials = {
         "tenant": api.username,
@@ -94,7 +117,6 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
         response.raise_for_status()
 
         payload = response.json()
-        # "data" ligger på top-niveau ved siden af "entity" (ikke inde i entity)
         form = payload["data"]["mine_medarbejder_data"]
         if not form.get("magistrat"):
             az_ident = form.get("az")
@@ -124,6 +146,78 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
             list_title="Tilmeldte medarbejdere",
             data=form,
             column_mapping=column_mapping,
+        )
+    elif formular_titel.lower() == "Blanket: Booking af Cykeløen".lower():
+        ctx = ClientContext(f'{base_url}{cykel_endelse}').with_client_certificate(**cert_credentials)
+        ctx.load(ctx.web)
+        ctx.execute_query()
+
+        url = f"{os2forms_url}cykeludlaan_i_mobilitet/submission/{anmodnings_id}"
+        headers = {"api-key": os2forms_api_key}
+        response = requests.get(url, headers=headers, timeout=60)
+        response.raise_for_status()
+
+        payload = response.json()
+        form = payload["data"]
+        submission_uuid = payload["entity"]["uuid"][0]["value"]  # global unik – til dedup
+
+        # --- Beregnet Title: institution + dato ---
+        institution = form.get("hvilken_skole_boernehave_eller_forening_booker_du_for_skriv_navn", "")
+        dato_raw = form.get("bookingdato", "")
+        form["titel_beregnet"] = f"{institution} - {dato_raw}".strip(" -")
+
+        # --- Dato (DateTime): kombinér dato + starttid, konvertér til UTC ---
+        starttid_raw = form.get("starttidspunkt_for_booking_", "00:00:00")
+        sluttid_raw = form.get("sluttidspunkt_for_booking", "00:00:00")
+        if dato_raw:
+            form["dato_beregnet"] = local_to_sharepoint_utc(dato_raw, starttid_raw)
+
+        # --- Starttid / Sluttid (Text): pæn visning uden sekunder ---
+        if starttid_raw:
+            form["starttidspunkt_for_booking_"] = format_time_text(starttid_raw)
+        if sluttid_raw:
+            form["sluttidspunkt_for_booking"] = format_time_text(sluttid_raw)
+
+        # --- Boolean-konvertering: formularen sender 'Ja'/'Nej' som streng ---
+        form["oensker_cykelundervisning_hvis_muligt_1"] = (
+            form.get("oensker_cykelundervisning_hvis_muligt_1") == "Ja"
+        )
+
+        # --- MultiChoice-felter: SharePoint REST API forventer {'results': [...]} ---
+        for felt in ("booking_af_cykelbane_r_", "booking_af_cykler"):
+            vaerdi = form.get(felt)
+            if vaerdi:
+                form[felt] = {"results": vaerdi if isinstance(vaerdi, list) else [vaerdi]}
+
+        # --- Dedup-nøgle til idempotens ved retry af samme submission ---
+        form["submission_uuid"] = submission_uuid
+
+        column_mapping = {
+            "titel_beregnet":                  "Title",
+            "dit_fulde_navn":                  "Fulde_navn",
+            "telefonnummer":                    "Telefonnummer",
+            "e_mailadresse":    "Mailadresse",
+            "hvilken_skole_boernehave_eller_forening_booker_du_for_skriv_navn": "Institution_navn",
+            "klassetrin_aldersgruppe":             "Klassetrin",
+            "antal_deltagende_boern_": "Antal_deltagere",
+            "dato_beregnet": "Dato",
+            "starttidspunkt_for_booking_": "Starttid",
+            "sluttidspunkt_for_booking": "Sluttid",
+            "booking_af_cykelbane_r_": "Cykelbaner",
+            "booking_af_cykler": "Cykler",
+            "oensker_cykelundervisning_hvis_muligt_1": "Cykelundervisning",
+            "kommentarer_til_din_booking": "Kommentar_til_booking",
+            "submission_uuid": "ID_os2forms",
+        }
+
+        add_item_to_sharepoint_list(
+            orchestrator_connection=orchestrator_connection,
+            client=ctx,
+            list_title="OS2data",
+            data=form,
+            column_mapping=column_mapping,
+            dedup_field="ID_os2forms",
+            dedup_value=submission_uuid,
         )
 
 
