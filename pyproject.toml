@@ -20,7 +20,8 @@ dependencies = [
     "Pillow == 10.*",
     "requests == 2.*",
     "Office365-REST-Python-Client >= 2.6.2",
-    "pyodbc == 5.*"
+    "pyodbc == 5.*",
+    "tzdata",
 ]
 
 [project.optional-dependencies]
