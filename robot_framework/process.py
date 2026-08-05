@@ -105,7 +105,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
         "thumbprint": certification.username,
         "cert_path": certification.password,
     }
-    if  formular_titel.lower() == "Tilmelding til Altinget".lower():
+    if  formular_titel.strip().lower() == "Tilmelding til Altinget".lower():
         ctx = ClientContext(f'{base_url}{altinget_endelse}').with_client_certificate(**cert_credentials)
         ctx.load(ctx.web)
         ctx.execute_query()
@@ -147,7 +147,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
             data=form,
             column_mapping=column_mapping,
         )
-    elif formular_titel.lower() == "Blanket: Booking af Cykeløen".lower():
+    elif formular_titel.strip().lower() == "Blanket: Booking af Cykeløen".lower():
         ctx = ClientContext(f'{base_url}{cykel_endelse}').with_client_certificate(**cert_credentials)
         ctx.load(ctx.web)
         ctx.execute_query()
