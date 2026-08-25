@@ -187,11 +187,15 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
             form.get("oensker_cykelundervisning_hvis_muligt_1") == "Ja"
         )
 
-        # --- MultiChoice-felter: SharePoint REST API forventer {'results': [...]} ---
         for felt in ("booking_af_cykelbane_r_", "booking_af_cykler"):
             vaerdi = form.get(felt)
-            if vaerdi:
-                form[felt] = {"results": vaerdi if isinstance(vaerdi, list) else [vaerdi]}
+
+            if isinstance(vaerdi, list):
+                form[felt] = {"results": vaerdi}
+            elif vaerdi:
+                form[felt] = {"results": [vaerdi]}
+            else:
+                form[felt] = {"results": []}
 
         # --- Dedup-nøgle til idempotens ved retry af samme submission ---
         form["submission_uuid"] = submission_uuid

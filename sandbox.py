@@ -10,6 +10,7 @@ import json
 orchestrator_connection = OrchestratorConnection('os2forms2sharepoint', os.getenv('OpenOrchestratorSQL'), os.getenv('OpenOrchestratorKey'), None, None)
 
 queue_element = MagicMock()
-queue_element.data = json.dumps({})
+queue_element.data = json.dumps({
+})
 
 process(orchestrator_connection= orchestrator_connection, queue_element= queue_element)
