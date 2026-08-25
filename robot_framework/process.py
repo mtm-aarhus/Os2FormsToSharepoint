@@ -117,7 +117,11 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
         response.raise_for_status()
 
         payload = response.json()
-        form = payload["data"]["mine_medarbejder_data"]
+        try:
+            form = payload["data"]["mine_medarbejder_data"]
+        except Exception as e:
+            orchestrator_connection.log_error(f'Ingen data fundet {e}')
+            return
         if not form.get("magistrat"):
             az_ident = form.get("az")
             magistrat = get_magistrat_from_fdw(orchestrator_connection, az_ident)
