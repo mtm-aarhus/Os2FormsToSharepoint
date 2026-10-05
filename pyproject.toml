@@ -16,7 +16,7 @@ classifiers = [
     "Operating System :: Microsoft :: Windows",
 ]
 dependencies = [
-    "OpenOrchestrator==2.0.1",
+    "OpenOrchestrator==3.0.0",
     "Pillow==10.4.0",
     "requests==2.34.2",
     "Office365-REST-Python-Client==3.2.0",
