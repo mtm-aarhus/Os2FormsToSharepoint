@@ -20,7 +20,7 @@ dependencies = [
     "Pillow==10.4.0",
     "requests==2.34.2",
     "Office365-REST-Python-Client==3.2.0",
-    "pyodbc==5.3.0",
+    "pyodbc==5.2.0",
     "tzdata==2026.5",
 ]
 
