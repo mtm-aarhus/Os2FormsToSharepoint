@@ -462,7 +462,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                         data=raekke,
                     ))
         except Exception:
-            orchestrator_connection.log_error(f"§8: fejl – sletter {len(oprettet)} oprettede rækker for {submission_uuid}.")
+            orchestrator_connection.log_info(f"§8: fejl – sletter {len(oprettet)} oprettede rækker for {submission_uuid}.")
             for item in reversed(oprettet):
                 try:
                     item.delete_object().execute_query()
