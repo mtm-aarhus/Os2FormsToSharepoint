@@ -10,6 +10,10 @@ import smtplib
 from email.message import EmailMessage
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import re
+import os
+from urllib.parse import urlparse, urljoin, unquote
+from office365.sharepoint.attachments.creation_information import AttachmentCreationInformation
 
 COPENHAGEN_TZ = ZoneInfo("Europe/Copenhagen")
 
@@ -31,10 +35,76 @@ def format_time_text(time_str: str) -> str:
     """Formatterer et tidspunkt fra formularen ('11:00:00') til 'HH:MM' til Text-feltet."""
     return datetime.strptime(time_str, "%H:%M:%S").strftime("%H:%M")
 
+
+def os2forms_tid_to_sharepoint_utc(value) -> str | None:
+    """Konverterer created/completed fra OS2Forms til SharePoints UTC-format.
+    Kommer som ISO-streng med tidszone ('2026-10-29T09:46:06+00:00'),
+    men Unix-sekunder håndteres også."""
+    if not value or str(value) == "0":
+        return None
+    value = str(value)
+    if value.isdigit():
+        dt = datetime.fromtimestamp(int(value), ZoneInfo("UTC"))
+    else:
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=COPENHAGEN_TZ)
+    return dt.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def tekst(value) -> str | None:
+    """Trimmer en formularværdi og gør tomme strenge til None."""
+    if value is None:
+        return None
+    return str(value).strip() or None
+
+
+def sp_link(url: str) -> dict:
+    """Værdi til en SharePoint-kolonne af typen 'Hyperlink eller billede'."""
+    url = url.replace(" ", "%20")[:255]
+    return {"__metadata": {"type": "SP.FieldUrlValue"}, "Url": url, "Description": url}
+
+
+def hent_os2forms_fil(form: dict, fil_id: str, os2forms_url: str, api_key: str) -> tuple[str, bytes]:
+    """Henter en uploadet fil fra OS2Forms. Returnerer (filnavn, indhold)."""
+    headers = {"api-key": api_key}
+    filnavn = None
+
+    # 1) OS2Forms' REST-modul lægger normalt fil-URL'en under data.linked
+    info = ((form.get("linked") or {}).get("upload_dokumenter") or {}).get(fil_id) or {}
+    fil_url = info.get("url")
+    print(f"[P8DEBUG] fil {fil_id}: linked-felter={sorted(info.keys())}")
+
+    # 2) Ellers slås filen op via entity/file
+    if not fil_url:
+        r = requests.get(f"{os2forms_url}entity/file/{fil_id}?_format=json", headers=headers, timeout=60)
+        print(f"[P8DEBUG] fil {fil_id}: entity/file -> {r.status_code} {r.headers.get('Content-Type')}")
+        r.raise_for_status()
+        entity = r.json()
+        print(f"[P8DEBUG] fil {fil_id}: entity-nøgler={sorted(entity.keys())}")
+        fil_url = entity["uri"][0]["url"]
+        filnavn = entity.get("filename", [{}])[0].get("value")
+
+    fil_url = urljoin(os2forms_url, fil_url)  # relativ /system/files/... -> fuld URL
+    r = requests.get(fil_url, headers=headers, timeout=120)
+    content_type = r.headers.get("Content-Type", "")
+    print(f"[P8DEBUG] fil {fil_id}: download {fil_url} -> {r.status_code} {content_type} {len(r.content)} bytes")
+    if not r.ok:
+        print(f"[P8DEBUG] fil {fil_id}: svar-body: {r.text[:500]!r}")
+    r.raise_for_status()
+
+    # Mangler API-brugeren adgang til private filer, svarer Drupal med en loginside og status 200
+    if "text/html" in content_type:
+        print(f"[P8DEBUG] fil {fil_id}: HTML i stedet for fil: {r.text[:300]!r}")
+        raise RuntimeError(f"Download af fil {fil_id} gav HTML i stedet for filen – tjek API-brugerens adgang til private filer.")
+
+    filnavn = filnavn or unquote(os.path.basename(urlparse(fil_url).path)) or f"fil_{fil_id}"
+    return filnavn, r.content
+
 def send_forkert_mag_mail(az, orchestrator_connection):
     SMTP_SERVER = "smtp.adm.aarhuskommune.dk"
     SMTP_PORT = 25
-    SCREENSHOT_SENDER = "PersonaleAktindsigtssag@aarhus.dk"
+    SCREENSHOT_SENDER = "altingetopretter@aarhus.dk"
     html_failed = f"""
     <html>
     <body>
@@ -226,6 +296,183 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
             column_mapping=column_mapping,
             dedup_field="ID_os2forms",
             dedup_value=submission_uuid,
+        )
+
+    elif formular_titel.strip().lower() == "jordforurening":
+        # §8-ansøgning. Skriver til fire forbundne lister på Jordportalen:
+        # P8Ansogninger + P8Adresser, P8Kontakter og P8Vedhaeftninger, der hver har en
+        # Lookup ("Ansogning", sættes som AnsogningId) til ansøgningen.
+        # Bemærk lille t i /teams/ her.
+        ctx = ClientContext(f'{base_url}/teams/Jordportalen').with_client_certificate(**cert_credentials)
+        ctx.load(ctx.web)
+        ctx.execute_query()
+
+        # Maskinnavnet er afkortet af Drupal ved 32 tegn – "_beb" er ikke en tastefejl
+        url = f"{os2forms_url}ansoegning_om_ss8_tilladelse_beb/submission/{anmodnings_id}"
+        headers = {"api-key": os2forms_api_key}
+        response = requests.get(url, headers=headers, timeout=60)
+        response.raise_for_status()
+
+        payload = response.json()
+        form = payload["data"]
+        entity = payload["entity"]
+        submission_uuid = entity["uuid"][0]["value"]
+        sid = (entity.get("sid") or [{}])[0].get("value")
+        serial = (entity.get("serial") or [{}])[0].get("value")
+        print(f"[P8DEBUG] data-nøgler: {sorted(form.keys())}")
+        print(f"[P8DEBUG] upload_dokumenter: {form.get('upload_dokumenter')!r}")
+
+        # --- Dedup: findes ansøgningen allerede, er den skrevet færdig ---
+        eksisterende = (
+            ctx.web.lists.get_by_title("P8Ansogninger")
+            .items.filter(f"SubmissionUUID eq '{submission_uuid}'")
+            .top(1).get().execute_query()
+        )
+        if len(eksisterende) > 0:
+            orchestrator_connection.log_info(f"§8: {submission_uuid} findes allerede – springer over.")
+            return
+
+        # --- Adresser (ubegrænset antal) ---
+        adresser = []
+        for blok in form.get("adresser") or []:
+            adresse = tekst(blok.get("vaelg_adresse"))
+            matrikel = tekst(blok.get("mat"))
+            lokalitet = tekst(blok.get("lokalitets_nummer"))
+            if adresse or matrikel or lokalitet:
+                adresser.append({
+                    "Title": adresse or "(uden adresse)",
+                    "Adresse": adresse,
+                    "Matrikel": matrikel,
+                    "LokalitetsNummer": lokalitet,
+                })
+
+        # --- Kontakter: blanketten er flad, hver part har sit eget suffiks ---
+        flere_grundejere = form.get("er_der_flere_grundejere") == "Ja"
+        bygherre_er_grundejer = form.get("er_bygherre_den_samme_som_grundejer") == "Ja"
+        parter = [("", "Grundejer")]
+        if flere_grundejere:
+            parter.append(("_2", "Grundejer"))   # grundejer nr. 2 har intet navnefelt
+        if not bygherre_er_grundejer:
+            parter.append(("_byg", "Bygherre"))
+        parter.append(("_raad", "Rådgiver"))
+
+        kontakter = []
+        for suffix, rolle in parter:
+            kontakt = {
+                "Navn": tekst(form.get(f"navn_kontaktperson{suffix}")),
+                "Firma": tekst(form.get(f"evt_firma{suffix}")),
+                "CVR": tekst(form.get(f"cvr{suffix}")),
+                # Bygherrens mailfelt har dobbelt underscore i blanketten
+                "Email": tekst(form.get("e_mail__byg" if suffix == "_byg" else f"e_mail{suffix}")),
+                "Telefon": tekst(form.get(f"telefon_nr{suffix}")),
+                "Adresse": tekst(form.get(f"adresse{suffix}")),
+            }
+            if not any(kontakt.values()):
+                continue
+            kontakt["KontaktType"] = rolle
+            kontakt["Title"] = kontakt["Navn"] or kontakt["Firma"] or rolle
+            kontakt["ErUdfylder"] = rolle == form.get("ansoegning_indsendt_af") and suffix != "_2"
+            kontakter.append(kontakt)
+
+        # --- Uploadede filer: kommer som fil-id'er (én fil kan komme som streng i stedet for liste) ---
+        fil_ids = form.get("upload_dokumenter") or []
+        if not isinstance(fil_ids, list):
+            fil_ids = [fil_ids]
+        fil_ids = [str(f) for f in fil_ids if f]
+
+        # --- Hovedrækken ---
+        adresse_tekster = [a["Adresse"] for a in adresser if a["Adresse"]]
+        if adresse_tekster:
+            titel = adresse_tekster[0]
+            if len(adresse_tekster) > 1:
+                titel += f" (+{len(adresse_tekster) - 1} flere)"
+        else:
+            titel = f"§8 – {serial}"
+        grundejere = [k["Navn"] or k["Firma"] for k in kontakter if k["KontaktType"] == "Grundejer"]
+        dato = form.get("vaelg_dato_for_ansoegning")
+        os2formsurl_basic = os2forms_url.rsplit('/da')[0]
+
+        ansogning = {
+            "Title": titel,
+            "SubmissionUUID": submission_uuid,
+            "SubmissionSerial": int(serial) if serial else None,
+            "SubmissionSid": int(sid) if sid else None,
+            "OS2FormsUrl": sp_link(f"{os2formsurl_basic}/admin/structure/webform/submission/{sid}") if sid else None,
+            "Udfylder": form.get("udfylder"),
+            "IndsendtAf": form.get("ansoegning_indsendt_af"),
+            "AnsogningsDato": local_to_sharepoint_utc(dato) if dato else None,
+            "Bemaerkninger": form.get("bemaerkninger"),
+            "ModtagetDato": os2forms_tid_to_sharepoint_utc((entity.get("created") or [{}])[0].get("value")),
+            "AfsluttetDato": os2forms_tid_to_sharepoint_utc((entity.get("completed") or [{}])[0].get("value")),
+            "FlereGrundejere": flere_grundejere,
+            "BygherreSammeSomGrundejer": bygherre_er_grundejer,
+            "Status": "Ny",  # sagsbehandlerens felt – sættes kun ved oprettelse
+            "AntalAdresser": len(adresser),
+            "AntalKontakter": len(kontakter),
+            "AntalVedhaeftninger": len(fil_ids),
+            "AdresserTekst": "\n".join(adresse_tekster) or None,
+            "Grundejere": "\n".join(grundejere) or None,
+        }
+
+        parent = add_item_to_sharepoint_list(
+            orchestrator_connection=orchestrator_connection,
+            client=ctx,
+            list_title="P8Ansogninger",
+            data=ansogning,
+        )
+
+        # --- Filer og detaljerækker. Fejler noget, slettes det oprettede igen – ellers ville
+        # dedup-tjekket ved næste retry springe ansøgningen over med manglende data. ---
+        oprettet = [parent]
+        try:
+            vedhaeftninger = []
+            brugte_navne = set()
+            for fil_id in fil_ids:
+                filnavn, indhold = hent_os2forms_fil(form, fil_id, os2forms_url, os2forms_api_key)
+                filnavn = re.sub(r'[\\/:*?"<>|#%]', "_", filnavn).strip() or f"fil_{fil_id}"
+                if filnavn.lower() in brugte_navne:
+                    filnavn = f"{fil_id}_{filnavn}"
+                brugte_navne.add(filnavn.lower())
+
+                attachment = parent.attachment_files.add(
+                    AttachmentCreationInformation(filnavn, indhold)
+                ).execute_query()
+                server_url = attachment.properties.get("ServerRelativeUrl")
+                print(f"[P8DEBUG] vedhæftet '{filnavn}' ({len(indhold)} bytes) -> {server_url}")
+
+                vedhaeftninger.append({
+                    "Title": filnavn,
+                    "FilId": fil_id,
+                    "Filnavn": filnavn,
+                    "FilUrl": sp_link(f"{base_url}{server_url}") if server_url else None,
+                })
+
+            for list_title, raekker in (
+                ("P8Adresser", adresser),
+                ("P8Kontakter", kontakter),
+                ("P8Vedhaeftninger", vedhaeftninger),
+            ):
+                for raekke in raekker:
+                    raekke["AnsogningId"] = parent.id
+                    raekke["SubmissionUUID"] = submission_uuid
+                    oprettet.append(add_item_to_sharepoint_list(
+                        orchestrator_connection=orchestrator_connection,
+                        client=ctx,
+                        list_title=list_title,
+                        data=raekke,
+                    ))
+        except Exception:
+            orchestrator_connection.log_error(f"§8: fejl – sletter {len(oprettet)} oprettede rækker for {submission_uuid}.")
+            for item in reversed(oprettet):
+                try:
+                    item.delete_object().execute_query()
+                except Exception as e:  # pylint: disable=broad-exception-caught
+                    orchestrator_connection.log_error(f"§8: kunne ikke slette item {item.id}: {e}")
+            raise
+
+        orchestrator_connection.log_info(
+            f"§8: {submission_uuid} skrevet som item {parent.id} med {len(adresser)} adresser, "
+            f"{len(kontakter)} kontakter og {len(vedhaeftninger)} filer."
         )
 
 
