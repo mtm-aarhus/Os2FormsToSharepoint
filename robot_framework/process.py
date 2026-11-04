@@ -59,6 +59,24 @@ def tekst(value) -> str | None:
     return str(value).strip() or None
 
 
+def rolle_fra_blanket(value) -> str | None:
+    """Oversætter blankettens rolle ('Ansøgning er indsendt af') til SharePoints valgmuligheder.
+
+    Knappen i blanketten hedder 'Miljørådgiver', mens listerne og jordportalen
+    bruger 'Rådgiver'. Matcher på en del af teksten, så både 'Miljørådgiver',
+    'Rådgiver' og 'Raadgiver' genkendes. Ukendte værdier giver None, så
+    valgfeltet i SharePoint ikke afviser rækken.
+    """
+    t = (tekst(value) or "").lower()
+    if "grundejer" in t:
+        return "Grundejer"
+    if "bygherre" in t:
+        return "Bygherre"
+    if "rådgiver" in t or "raadgiver" in t or "radgiver" in t:
+        return "Rådgiver"
+    return None
+
+
 def sp_link(url: str) -> dict:
     """Værdi til en SharePoint-kolonne af typen 'Hyperlink eller billede'."""
     url = url.replace(" ", "%20")[:255]
@@ -356,6 +374,15 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
             parter.append(("_byg", "Bygherre"))
         parter.append(("_raad", "Rådgiver"))
 
+        indsendt_af = rolle_fra_blanket(form.get("ansoegning_indsendt_af"))
+        if form.get("ansoegning_indsendt_af") and not indsendt_af:
+            orchestrator_connection.log_info(
+                f"§8: ukendt værdi i 'ansoegning_indsendt_af': {form.get('ansoegning_indsendt_af')!r}"
+            )
+        # Er bygherren den samme som grundejeren, findes der ingen bygherre-kontakt –
+        # så er det grundejeren, der har udfyldt.
+        udfylder_rolle = "Grundejer" if indsendt_af == "Bygherre" and bygherre_er_grundejer else indsendt_af
+
         kontakter = []
         for suffix, rolle in parter:
             kontakt = {
@@ -370,8 +397,9 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
             if not any(kontakt.values()):
                 continue
             kontakt["KontaktType"] = rolle
-            kontakt["Title"] = kontakt["Navn"] or kontakt["Firma"] or rolle
-            kontakt["ErUdfylder"] = rolle == form.get("ansoegning_indsendt_af") and suffix != "_2"
+            # Grundejer nr. 2 har intet navnefelt – "Grundejer 2" i stedet for et tomt navn
+            kontakt["Title"] = kontakt["Navn"] or kontakt["Firma"] or ("Grundejer 2" if suffix == "_2" else rolle)
+            kontakt["ErUdfylder"] = rolle == udfylder_rolle and suffix != "_2"
             kontakter.append(kontakt)
 
         # --- Uploadede filer: kommer som fil-id'er (én fil kan komme som streng i stedet for liste) ---
@@ -403,7 +431,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
             "SubmissionSid": int(sid) if sid else None,
             "OS2FormsUrl": sp_link(f"{os2formsurl_basic}/admin/structure/webform/submission/{sid}") if sid else None,
             "Udfylder": form.get("udfylder"),
-            "IndsendtAf": form.get("ansoegning_indsendt_af"),
+            "IndsendtAf": indsendt_af,
             "AnsogningsDato": local_to_sharepoint_utc(dato) if dato else None,
             "Bemaerkninger": form.get("bemaerkninger"),
             "ModtagetDato": os2forms_tid_to_sharepoint_utc((entity.get("created") or [{}])[0].get("value")),
