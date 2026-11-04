@@ -388,7 +388,11 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                 titel += f" (+{len(adresse_tekster) - 1} flere)"
         else:
             titel = f"§8 – {serial}"
-        grundejere = [k["Navn"] or k["Firma"] for k in kontakter if k["KontaktType"] == "Grundejer"]
+        grundejere = [
+            k["Navn"] or k["Firma"]
+            for k in kontakter
+            if k["KontaktType"] == "Grundejer" and (k["Navn"] or k["Firma"])
+        ]
         dato = form.get("vaelg_dato_for_ansoegning")
         os2formsurl_basic = os2forms_url.rsplit('/da')[0]
 

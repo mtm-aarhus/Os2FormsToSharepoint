@@ -9,7 +9,7 @@ FAIL_ROBOT_ON_TOO_MANY_ERRORS = True
 # Error screenshot config
 SMTP_SERVER = "smtp.adm.aarhuskommune.dk"
 SMTP_PORT = 25
-SCREENSHOT_SENDER = "os2formstosharepoint.dk"
+SCREENSHOT_SENDER = "os2formstosharepoint@aarhus.dk"
 
 # Constant/Credential names
 ERROR_EMAIL = "Error Email"
